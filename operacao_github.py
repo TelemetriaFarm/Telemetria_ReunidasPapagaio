@@ -9,12 +9,12 @@ import math
 from collections import Counter
 import locale
 import os
-import sys
+import sys  # Adicionado para o feedback visual
 
 # --- CONFIGURAÇÕES FIXAS (PARA O GITHUB) ---
 GROWER_ID_FIXO = 568674 # Jose Laerte Cardoso Godoi
 # Dias para analisar para trás (ex: 5 dias)
-DIAS_ANALISE = 14
+DIAS_ANALISE = 7
 
 # Dados da Estação (Hardcoded para não precisar subir Excel)
 ESTACOES_FIXAS = [
@@ -74,7 +74,7 @@ class AnalisadorTelemetriaClima:
         self.fuso_horario_cuiaba = timezone('America/Cuiaba')
         self.operacoes_definidas = []
         
-        # Carrega estações fixas (substitui o Excel)
+        # Carrega estações fixas
         self.estacoes_climaticas = pd.DataFrame(ESTACOES_FIXAS)
 
     def _get_estacoes_para_produtor(self, grower_id: int) -> pd.DataFrame:
@@ -147,19 +147,24 @@ class AnalisadorTelemetriaClima:
         df['merge_hour'] = df['datetime_local'].dt.hour
         return df
 
+    # --- IMPLEMENTAÇÃO MELHORADA DO REQUEST (DO CÓDIGO 2) ---
     def _fazer_requisicao(self, url: str, params: dict = None) -> dict | list | None:
-        for tentativa in range(2):
+        for tentativa in range(3): # Aumentado para 3 tentativas
             try:
                 response = self.session.get(url, params=params, timeout=180)
                 response.raise_for_status()
                 return response.json()
             except requests.exceptions.RequestException as e:
+                # Se for erro de autenticação, tenta renovar
                 if isinstance(e, requests.exceptions.HTTPError) and e.response.status_code in [401, 403]:
                     print("Sessão expirada. Re-autenticando...")
                     self.session = get_authenticated_session()
                     if not self.session: return None
                     continue
-                if tentativa == 0: time.sleep(5)
+                
+                # Se não for a última tentativa, espera um pouco
+                if tentativa < 2: 
+                    time.sleep(2)
             except json.JSONDecodeError: return None
         return None
 
@@ -168,16 +173,28 @@ class AnalisadorTelemetriaClima:
         params = {'endDate': data_fim, 'format': 'json', 'implementID': implement_id, 'startDate': data_inicio}
         return self._fazer_requisicao(url, params)
 
+    # --- IMPLEMENTAÇÃO DA BUSCA SOFISTICADA "FORMIGUINHA" (DO CÓDIGO 2) ---
     def _buscar_dados_telemetria_com_chunking(self, implement_id: int, start_date_str: str, end_date_str: str) -> pd.DataFrame:
+        """
+        Estratégia Formiguinha V3 importada do Código 2.
+        Busca hora a hora com feedback visual e alta resiliência.
+        """
         all_dfs = []
-        start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
-        end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        try:
+            start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+            end_date = datetime.strptime(end_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            start_date = pd.to_datetime(start_date_str).date()
+            end_date = pd.to_datetime(end_date_str).date()
+
         current_date = start_date
         
-        print(f"  Buscando dados de hora em hora (ID: {implement_id})...")
+        print(f"\nIniciando busca detalhada para Máquina ID: {implement_id}...")
 
         while current_date <= end_date:
             date_str = current_date.strftime('%Y-%m-%d')
+            print(f"  >>> Processando Dia: {date_str}", end=" ")
+            
             horas = range(24)
             for h in horas:
                 start_time = f"{h:02d}:00:00"
@@ -187,28 +204,41 @@ class AnalisadorTelemetriaClima:
                 
                 sucesso = False
                 tentativas = 0
-                while not sucesso and tentativas < 3:
+                max_retries = 3
+                
+                while not sucesso and tentativas < max_retries:
                     try:
-                        if tentativas > 0: time.sleep(3)
+                        if tentativas > 0: time.sleep(2)
+                        
+                        # Chama a busca básica
                         json_data = self.buscar_dados_telemetria(implement_id, api_start, api_end)
+                        
                         if json_data:
+                            # Chama o parser do Código 1 (adaptado para o fluxo)
                             df_chunk = self._analisar_json_telemetria_para_df(json_data, implement_id)
+                            
                             if not df_chunk.empty:
                                 all_dfs.append(df_chunk)
-                                sys.stdout.write(".") 
+                                sys.stdout.write(".") # Sucesso com dados
                             else:
-                                sys.stdout.write("_")
+                                sys.stdout.write("_") # Sucesso mas sem dados (parado)
                         else:
-                            sys.stdout.write("x")
+                            sys.stdout.write("x") # Falha na requisição
+                        
                         sys.stdout.flush()
                         sucesso = True
                     except Exception:
                         tentativas += 1
-                        time.sleep(2)
+                        time.sleep(1)
+                
+                if not sucesso:
+                    sys.stdout.write("!") # Falha total no bloco
+            
+            print("") # Pula linha após terminar o dia
             current_date += timedelta(days=1)
             
         if not all_dfs: return pd.DataFrame()
-        print("\n  Consolidando dados...")
+        print("  Consolidando dados...")
         df_combined = pd.concat(all_dfs, ignore_index=True)
         if 'Timestamp (sec)' in df_combined.columns:
             df_combined = df_combined.drop_duplicates(subset=['Timestamp (sec)', 'ImplementID'])
@@ -543,6 +573,7 @@ class AnalisadorTelemetriaClima:
         df_clima_completo = self._buscar_dados_climaticos_para_produtor(grower_id, data_inicio, data_fim)
         estacoes_deste_produtor = self._get_estacoes_para_produtor(grower_id)
 
+        # AQUI FOI SUBSTITUÍDO PELO MÉTODO MAIS ROBUSTO DE CHUNKING
         dfs_telemetria = [df for df in [self._buscar_dados_telemetria_com_chunking(imp, data_inicio, data_fim) for imp in implement_ids] if not df.empty]
         if not dfs_telemetria:
             print("Sem dados de telemetria.")
